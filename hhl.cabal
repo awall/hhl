@@ -19,3 +19,8 @@ executable hhl
   default-language:    Haskell2010
   build-depends:       base >= 4.7 && < 5
                      , wreq
+                     , lens
+                     , connection
+                     , http-client-tls
+                     , bytestring
+  default-extensions:  OverloadedStrings
