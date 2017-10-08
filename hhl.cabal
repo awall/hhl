@@ -23,4 +23,9 @@ executable hhl
                      , connection
                      , http-client-tls
                      , bytestring
+                     , base64-bytestring
+                     , containers
+                     , aeson
+                     , lens-aeson
+                     , text
   default-extensions:  OverloadedStrings
