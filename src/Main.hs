@@ -1,21 +1,20 @@
 module Main where
 
 import Control.Lens
-import Data.Text as Text (Text, pack, unpack)
+import qualified Data.Text as T (pack, unpack)
 import Data.Aeson.Lens(key, _String, values)
 import Network.Wreq
 
 import qualified Data.ByteString.Char8 as BS (pack)
 import qualified Data.ByteString.Base64 as BS (encode)
 import qualified Data.ByteString as BS hiding (pack)
+
+import Network.Connection      (TLSSettings (..))
+import Network.HTTP.Client.TLS (mkManagerSettings)
+
+import System.IO (hFlush, stdout)
+
 import qualified Data.ByteString.Lazy as BL
-
--- Ignore the fact that the we don't recognize the Certificate Authority
--- see https://gist.github.com/j-keck/4f025ea39d6da259c1dc
-
--- import Network.Connection      (TLSSettings (..))
--- import Network.HTTP.Client.TLS (mkManagerSettings)
--- defaults & manager .~ Left (mkManagerSettings (TLSSettingsSimple True False False) Nothing)
 
 --
 -- Utils
@@ -30,11 +29,11 @@ credentials :: FilePath
 credentials = 
   "./data/credentials.b64"
 
-promptCredentials :: IO (BS.ByteString, BS.ByteString)
-promptCredentials = do
-  putStr "User: "
+requestCredentials :: IO (BS.ByteString, BS.ByteString)
+requestCredentials = do
+  putStr "User: " >> hFlush stdout
   user <- getLine
-  putStr "Password: "
+  putStr "Password: " >> hFlush stdout
   pass <- getLine
   return (BS.pack user, BS.pack pass)
 
@@ -46,9 +45,6 @@ writeCredentials (user, pass) =
 getCredentials :: IO BS.ByteString
 getCredentials = BS.readFile credentials
 
-updateCredentials :: IO ()
-updateCredentials = promptCredentials >>= writeCredentials
-
 --
 -- HTTPS requests
 --
@@ -58,60 +54,98 @@ addAuth b64 opts =
 
 getWith' :: Options -> Url -> IO (Response (BL.ByteString))
 getWith' opts url = do
+  -- Ignore the fact that the we don't recognize the Certificate Authority
+  -- see https://gist.github.com/j-keck/4f025ea39d6da259c1dc
+  let fixedOpts = opts & manager .~ Left (mkManagerSettings (TLSSettingsSimple True False False) Nothing)
   b64 <- getCredentials  
-  getWith (addAuth b64 opts) url
+  getWith (addAuth b64 fixedOpts) url
 
 --
 -- URLs
 --
 type Url = String
 
-oldUrl, gamelogsUrl :: Url
-oldUrl = "https://api.mysportsfeeds.com/v1.1/pull/nhl/2016-2017-regular/full_game_schedule.json"
-gamelogsUrl = "https://api.mysportsfeeds.com/v1.1/pull/nhl/2016-2017-regular/team_gamelogs.json"
+lastSeasonGamesUrl, scheduleUrl :: Url
+scheduleUrl = "https://api.mysportsfeeds.com/v1.1/pull/nhl/2016-2017-regular/full_game_schedule.json"
+lastSeasonGamesUrl = "https://api.mysportsfeeds.com/v1.1/pull/nhl/2016-2017-regular/team_gamelogs.json"
+currentSeasonGamesUrl = "https://api.mysportsfeeds.com/v1.1/pull/nhl/2017-2018-regular/team_gamelogs.json"
 
 --
 -- Extracting Data from MySportsFeeds
 --
-data HA = H | A deriving (Show, Read)
-data WLOT = W | L | OT deriving (Show, Read)
-data Game = Game {
-    me :: String
-  , opp :: String
-  , ha :: HA
+data HA = H | A
+data WLOT = W | L | OT
+data GameLog = GameLog {
+    team :: String
   , wlot :: WLOT
-  , gf :: Int
-  , ga :: Int
+}
+
+data Record = Record {
+    wins :: Int
+  , losses :: Int
+  , overtimeWins :: Int
 } deriving (Show, Read)
 
-downloadGamesForTeam :: Int -> IO [Game]
-downloadGamesForTeam teamid = do
-  let opts = defaults & param "team" .~ [Text.pack $ show teamid]
-  resp <- getWith' opts gamelogsUrl
+data MultiSeasonRecord = MultiSeasonRecord {
+    lastSeason :: Record
+  , currentSeason  :: Record
+} deriving (Show, Read)
+
+record :: [GameLog] -> (String, Record)
+record games =
+  foldl joinRecords ("", Record { wins = 0, losses = 0, overtimeWins = 0}) games
+  where joinRecords (_, (Record ws ls ots))  (GameLog tm wlo) = (tm, 
+          case wlo of W  -> Record { wins = ws + 1, losses = ls, overtimeWins = ots }
+                      L  -> Record { wins = ws, losses = ls + 1, overtimeWins = ots }
+                      OT -> Record { wins = ws, losses = ls, overtimeWins = ots + 1 })
+
+requestGamesForTeam :: Url -> Int -> IO [GameLog]
+requestGamesForTeam url teamid = do
+  let opts = defaults & param "team" .~ [T.pack $ show teamid]
+  resp <- getWith' opts url
   let gamelogs = resp ^.. responseBody . key "teamgamelogs" . key "gamelogs" . values
-  return $ map (toGame . extract) gamelogs
+  return $ map (toGameLog . extract) gamelogs
   where 
     extract g = 
-          let source = g ^. key "team" . key "City" . _String
-              city x = g ^. key "game" . key x . key "City" . _String
+          let source = g ^. key "team" . key "Abbreviation" . _String
               stat x = g ^. key "stats" . key x . key "#text" . _String
-          in (source, city "homeTeam", city "awayTeam", stat "Wins", stat "Losses", stat "GoalsFor", stat "GoalsAgainst")
-    toGame (tm, home, away, wins, losses, gfor, gagainst) =
-      Game {
-          me = Text.unpack tm
-        , opp = Text.unpack (if home == tm then away else home)
-        , ha = if home == tm then H else A
-        , wlot = if wins == "1" then W else if losses == "1" then L else OT
-        , gf = read (Text.unpack gfor)
-        , ga = read (Text.unpack gagainst)
+          in (source, stat "Wins", stat "Losses")
+    toGameLog (tm, ws, ls) =
+      GameLog {
+          team = T.unpack tm
+        , wlot = if ws == "1" then W else if ls == "1" then L else OT
       }
-  
-downloadAllGames :: IO [Game]
-downloadAllGames =
-  concat <$> mapM downloadGamesForTeam allTeams
-  where allTeams = [1..31]
+
+requestRecord :: Url -> Int -> IO (String, Record)
+requestRecord url t =
+  record <$> requestGamesForTeam url t
+
+requestMultiSeasonRecord :: Int -> IO (String, MultiSeasonRecord)
+requestMultiSeasonRecord t = do
+  (_, ls) <- requestRecord lastSeasonGamesUrl t
+  (tm, cs) <- requestRecord currentSeasonGamesUrl t
+  return $ (tm, MultiSeasonRecord {
+      lastSeason = ls
+    , currentSeason = cs
+  })
+
+run :: String -> IO ()
+run "updateCredentials" = requestCredentials >>= writeCredentials
+run "showRecords" = do
+  allRecords <- mapM requestMultiSeasonRecord [1 .. 31]
+  mapM_ (putStrLn . showRecord) allRecords  
+  where showRecord (t, x) = show (t, x)
+
+run _ = return ()
+
+loop :: IO ()
+loop = do
+  putStr ">"
+  hFlush stdout
+  cmd <- getLine
+  if cmd == "exit" || cmd == "quit" 
+    then putStrLn "Bye."
+    else run cmd >> putStrLn "Done." >> loop
 
 main :: IO ()
-main = do
-  resp <- getWith' defaults oldUrl
-  return ()
+main = loop  
