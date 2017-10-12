@@ -28,4 +28,5 @@ executable hhl
                      , aeson
                      , lens-aeson
                      , text
-  default-extensions:  OverloadedStrings
+                     , time
+  default-extensions:  OverloadedStrings, TupleSections
